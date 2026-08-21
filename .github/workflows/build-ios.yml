@@ -1,0 +1,91 @@
+name: Build iOS app
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Unpack ios_source.tar.gz
+        run: |
+          mkdir -p app
+          tar -xzf ios_source.tar.gz -C app
+          ls -R app | head -100
+
+      - name: Detect project type
+        id: detect
+        run: |
+          cd app
+          ROOT=$(dirname "$(find . -maxdepth 4 -name 'package.json' -not -path '*/node_modules/*' | head -1)")
+          echo "js_root=$ROOT" >> $GITHUB_OUTPUT
+          find . -maxdepth 5 -name '*.xcworkspace' -o -maxdepth 5 -name '*.xcodeproj' | head -20
+
+      - name: Install JS deps (if a JS app)
+        run: |
+          cd app/${{ steps.detect.outputs.js_root }} 2>/dev/null || exit 0
+          if [ -f package.json ]; then
+            npm install --legacy-peer-deps || true
+            npx cap sync ios || true
+          fi
+        continue-on-error: true
+
+      - name: Install CocoaPods
+        run: |
+          cd app
+          POD=$(find . -maxdepth 5 -name Podfile | head -1)
+          if [ -n "$POD" ]; then cd "$(dirname "$POD")" && pod install --repo-update; fi
+        continue-on-error: true
+
+      - name: Build unsigned app
+        run: |
+          cd app
+          WS=$(find . -maxdepth 5 -name '*.xcworkspace' | head -1)
+          PROJ=$(find . -maxdepth 5 -name '*.xcodeproj' | head -1)
+          if [ -n "$WS" ]; then TARGET_FLAG="-workspace $WS"; else TARGET_FLAG="-project $PROJ"; fi
+          SCHEME=$(xcodebuild $TARGET_FLAG -list | awk '/Schemes:/{f=1;next} f&&NF{print $1; exit}')
+          echo "Building scheme: $SCHEME"
+          xcodebuild $TARGET_FLAG -scheme "$SCHEME" \
+            -configuration Release -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO build
+
+      - name: Package .ipa
+        run: |
+          cd app
+          APP=$(find build/Build/Products -maxdepth 2 -name '*.app' | head -1)
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out && zip -qry app-unsigned.ipa Payload
+
+      - name: Simulator screenshot
+        run: |
+          cd app
+          WS=$(find . -maxdepth 5 -name '*.xcworkspace' | head -1)
+          PROJ=$(find . -maxdepth 5 -name '*.xcodeproj' | head -1)
+          if [ -n "$WS" ]; then TARGET_FLAG="-workspace $WS"; else TARGET_FLAG="-project $PROJ"; fi
+          SCHEME=$(xcodebuild $TARGET_FLAG -list | awk '/Schemes:/{f=1;next} f&&NF{print $1; exit}')
+          xcodebuild $TARGET_FLAG -scheme "$SCHEME" -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name=iPhone 15' \
+            -derivedDataPath simbuild \
+            CODE_SIGNING_ALLOWED=NO build
+          SIM_APP=$(find simbuild/Build/Products -maxdepth 2 -name '*.app' | head -1)
+          BID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$SIM_APP/Info.plist")
+          xcrun simctl boot "iPhone 15" || true
+          xcrun simctl install booted "$SIM_APP"
+          xcrun simctl launch booted "$BID"
+          sleep 15
+          xcrun simctl io booted screenshot screenshot.png
+        continue-on-error: true
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build
+          path: |
+            app/out/app-unsigned.ipa
+            app/screenshot.png
